@@ -1,202 +1,196 @@
-# BTC/USDC · Live on Hyperliquid
+# BTC/USDC · Hyperliquid Live Price Dashboard
 
-A free, client-side, mobile-first dashboard that streams the live BTC/USDC
-spot market from **Hyperliquid** — no backend, no API key, no wallet
-connection. Built to be hosted for $0 on GitHub Pages.
+A free, static, mobile-first dashboard that monitors the BTC/USDC spot
+price on **Hyperliquid** in real time. It is read-only: there is no
+trading, no order placement, and no wallet connection anywhere in this
+app.
 
 ---
 
-## 1. What it does
+## 1. Project overview
 
-- Streams the live BTC/USDC price, best bid/ask, order book, and recent
-  trades directly from Hyperliquid's public WebSocket.
-- Shows 24h change, high, low, and volume.
-- Renders a candlestick chart (1m / 5m / 15m / 1h / 4h / 1d) using real
-  Hyperliquid candle data, live-updating as new bars form.
-- Lets you set a client-side price alert (with an optional sound and
-  browser notification) — stored only in your browser's `localStorage`.
-- Reconnects automatically with exponential backoff if the connection
-  drops, and never shows "LIVE" unless it's actually receiving valid data.
-- Is strictly **read-only**: it never asks for a wallet, private key, or
-  seed phrase, and it cannot place, modify, or cancel any order.
+This app shows exactly one thing well: the live BTC/USDC price on
+Hyperliquid.
+
+- Large current price, 24H change (absolute + %), 24H high/low/volume
+- A live, timeframe-switchable price chart (1H / 4H / 1D / 1W / 1M)
+- A connection indicator (LIVE / CONNECTING / RECONNECTING / DISCONNECTED)
+- An optional client-side price alert (localStorage + browser notification)
+
+No order book, no bid/ask, no recent-trades table, no buy/sell buttons.
+It is a monitoring dashboard, not a trading terminal.
 
 ## 2. Hyperliquid API architecture
 
+All data comes from Hyperliquid's public Info API and WebSocket API —
+no API key, no account, and no signing is required for any of it,
+because everything used here is public market data.
+
 ```
 Browser
-   │  WebSocket (wss://api.hyperliquid.xyz/ws)
-   ▼
-Hyperliquid public market data
-   │  allMids / l2Book / trades / candle channels
-   ▼
-JavaScript (js/hyperliquid.js)
-   │
-   ▼
-Chart + UI (js/app.js, js/chart.js)
+  │
+  ├── REST  POST https://api.hyperliquid.xyz/info
+  │         → resolve the exact market id, seed chart candles,
+  │           compute the rolling 24H high/low
+  │
+  └── WS    wss://api.hyperliquid.xyz/ws
+            → live price context + live candle updates
 ```
 
-Two Hyperliquid surfaces are used, both public and unauthenticated:
+## 3. WebSocket architecture
 
-- **Info endpoint (REST)** — `POST https://api.hyperliquid.xyz/info` — used
-  once at load for market metadata (`spotMeta`), 24h reference stats
-  (`spotMetaAndAssetCtxs`), and historical candles (`candleSnapshot`).
-- **WebSocket** — `wss://api.hyperliquid.xyz/ws` — used continuously for
-  live price, order book, trade, and candle updates.
+```
+Browser
+   ↓ subscribe {"type":"activeAssetCtx","coin":"@<index>"}
+   ↓ subscribe {"type":"candle","coin":"@<index>","interval":"<tf>"}
+Hyperliquid WebSocket
+   ↓ channel "activeSpotAssetCtx" → live markPx / midPx / prevDayPx / dayNtlVlm
+   ↓ channel "candle"             → live OHLC bar for the active timeframe
+Dashboard
+   → price, 24H change, 24H stats, and chart all update without polling
+```
 
-Official docs:
-- API overview: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api
-- Info endpoint: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint
-- Spot info endpoints: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/info-endpoint/spot
-- WebSocket: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket
-- WebSocket subscriptions: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/websocket/subscriptions
+`js/hyperliquid.js` owns the socket lifecycle:
 
-## 3. Exact BTC/USDC market identifier
+- **One socket at a time.** `openSocket()` no-ops if a socket is already
+  open or connecting, so rapid reconnect attempts can never stack.
+- **Heartbeat.** A `{"method":"ping"}` frame is sent every 25s to keep the
+  connection alive per Hyperliquid's timeout/heartbeat rules.
+- **Staleness watchdog.** If no message arrives for 15s, the UI stops
+  claiming `LIVE`, the socket is closed, and a clean reconnect begins —
+  so the dashboard never shows a stale price as if it were live.
+- **Exponential backoff.** Reconnects start at 1s and double up to a
+  30s ceiling, with a little random jitter, and resubscribe to the same
+  channels automatically once reconnected.
 
-This is the part most integrations get wrong, so it's worth spelling out.
+## 4. Exact BTC/USDC market identifier
 
-Hyperliquid's own docs state that for spot markets, the `coin` identifier
-used in requests is **not** a human-readable ticker — it's `PURR/USDC` for
-the PURR pair, and `@{index}` for every other spot pair, where `index` is
-that pair's position in the `universe` array returned by the `spotMeta`
-info method.
+Hyperliquid spot markets are addressed as `@<universe index>` (the only
+exception is `PURR/USDC`, which is addressed by name). That index is
+**not hard-coded** in this project — it's resolved at runtime:
 
-What's shown as **"BTC/USDC"** in the Hyperliquid app actually corresponds
-to the underlying HyperCore token **`UBTC`** (Bitcoin, tokenized onto
-Hyperliquid via the Unit protocol) paired against USDC — **not** a token
-literally named "BTC". Because the numeric index can change if Hyperliquid
-reorders the spot universe, this dashboard **never hard-codes** it. Instead,
-on every load, `js/hyperliquid.js`:
+1. On load, the app calls `POST /info {"type":"spotMeta"}`.
+2. It finds the token named `UBTC` (the token that backs BTC on
+   HyperCore) and the token named `USDC`.
+3. It finds the entry in `universe` whose `tokens` pair is
+   `[UBTC_index, USDC_index]`, and reads that entry's `index`.
+4. The market id used for every REST/WS call is `@<that index>`.
 
-1. Calls `spotMeta` and finds the token named `UBTC` (falling back to `BTC`
-   if that ever changes) in the `tokens` array, noting its token `index`.
-2. Finds the entry in the `universe` array whose `tokens` field is
-   `[thatIndex, 0]` (`0` is USDC, the universal spot quote token).
-3. Builds the wire identifier as `@{universe_entry.index}`.
+Why `UBTC` and not `BTC`: on Hyperliquid, the pair labeled **BTC/USDC**
+in `app.hyperliquid.xyz`'s own UI corresponds on-chain to the spot pair
+**UBTC/USDC** on HyperCore. This app follows Hyperliquid's own mapping —
+it is not a substitution to a different asset or a different quote
+currency, and the dashboard always labels the pair as **BTC/USDC** to
+match what you'd see on Hyperliquid itself. If this resolution step
+ever fails (e.g. Hyperliquid restructures its spot universe), the app
+shows a clear error banner instead of guessing an index or fabricating
+a price.
 
-That resolved identifier — shown in the dashboard's "Market Data Details"
-panel — is what's used for every subsequent REST and WebSocket call.
+## 5. How live price updates work
 
-## 4. How live price data works
+The `activeAssetCtx` WebSocket subscription (which Hyperliquid returns
+under the channel name `activeSpotAssetCtx` for spot markets) pushes,
+on every price-relevant change:
 
-On connect, the client subscribes to three channels for the resolved
-market: `l2Book` (order book → best bid/ask/spread), `trades` (recent
-trade tape), and `candle` (the active timeframe's OHLCV bars). The
-headline price is taken from the mid/mark price implied by the order
-book and trade stream as it updates live; every incoming WebSocket
-message is validated before touching the UI (missing fields, non-numeric
-prices, and malformed payloads are all discarded, not rendered).
+| Field        | Used for                              |
+|--------------|----------------------------------------|
+| `markPx`     | the headline current price             |
+| `midPx`      | fallback if `markPx` is briefly absent |
+| `prevDayPx`  | 24H change (absolute and %)            |
+| `dayNtlVlm`  | 24H volume, in USDC notional           |
 
-## 5. How historical candles work
+The price element flashes green/red for 300–500ms on each tick, and the
+running 24H high/low are extended live if the price crosses them
+between REST refreshes.
 
-Chart history is loaded once per timeframe via the `candleSnapshot` info
-method (`{"type":"candleSnapshot","req":{"coin": "<resolved id>",
-"interval": "...", "startTime": ..., "endTime": ...}}`), then kept live by
-the `candle` WebSocket subscription, which pushes an updated bar every
-time the current candle changes. Switching timeframes unsubscribes the old
-`candle` feed, re-fetches history for the new interval, and subscribes to
-the new one — no page reload required.
+## 6. How historical chart data works
 
-24h high/low is computed from the last 24 hourly candles (Hyperliquid's
-asset-context response doesn't expose high/low directly), rather than
-being estimated or fabricated.
+Chart candles come from `POST /info {"type":"candleSnapshot", ...}`.
+Each timeframe button maps to a lookback window and a candle interval:
 
-## 6. How to deploy to GitHub Pages
+| Timeframe | Range   | Candle interval |
+|-----------|---------|------------------|
+| 1H        | 1 hour  | 1m               |
+| 4H        | 4 hours | 5m               |
+| 1D        | 1 day   | 15m              |
+| 1W        | 1 week  | 1h               |
+| 1M        | 30 days | 4h               |
+
+Switching timeframes re-fetches history for that window and
+re-subscribes the `candle` WebSocket feed to the matching interval, so
+the visible chart keeps updating live without a page refresh. The
+independent **24H HIGH / 24H LOW** stat always uses 1h candles over the
+trailing 24 hours, refreshed every 60s, regardless of which timeframe
+the chart is showing.
+
+The selected timeframe is remembered in `localStorage`.
+
+## 7. How price alerts work
+
+Alerts are entirely client-side — there is no backend to hold them:
+
+- Set a target price and **Above**/**Below**, stored in `localStorage`.
+- Every incoming price tick is checked against the active alert.
+- On a cross, the dashboard shows an in-page toast and, if you granted
+  permission, a browser notification.
+- You can disable, re-enable, or delete the alert at any time.
+
+Because there's no server, an alert only fires while this tab is open
+in your browser. That's stated in the UI so it isn't a surprise.
+
+## 8. GitHub Pages deployment
 
 1. Create a new GitHub repository, e.g. `btc-usdc-hyperliquid`.
-2. Add all the files from this project, preserving the folder structure:
-   ```
-   btc-usdc-hyperliquid/
-   ├── index.html
-   ├── css/style.css
-   ├── js/config.js
-   ├── js/hyperliquid.js
-   ├── js/chart.js
-   ├── js/alerts.js
-   ├── js/app.js
-   ├── assets/btc.svg
-   └── README.md
-   ```
-3. Commit and push to the `main` branch.
-4. In the repository, go to **Settings → Pages**.
-5. Under **Build and deployment → Source**, choose **Deploy from a
+2. Upload this project's contents to the repository root (keep the
+   `css/`, `js/`, and `assets/` folders intact — don't nest everything
+   inside an extra subfolder).
+3. In the repo, go to **Settings → Pages**.
+4. Under **Build and deployment → Source**, choose **Deploy from a
    branch**.
-6. Under **Branch**, choose `main` and folder `/ (root)`, then **Save**.
-7. Wait 1–2 minutes. Your dashboard will be live at:
-   ```
-   https://USERNAME.github.io/btc-usdc-hyperliquid/
-   ```
+5. Choose the `main` branch and the `/ (root)` folder, then **Save**.
+6. Wait a minute or two, then open the URL GitHub shows you:
+   `https://USERNAME.github.io/REPOSITORY/`
 
-All asset paths in this project are relative (`css/style.css`,
-`js/app.js`, `assets/btc.svg`, …), so it works whether it's served from
-the repository root or a subdirectory — no configuration changes needed.
+No build step, no server, no environment variables — it's plain
+HTML/CSS/JS plus one CDN script tag for the charting library.
 
-## 7. How to configure alerts
+### Step-by-step: uploading via the GitHub website (no git required)
 
-1. Open the **Price Alert** panel.
-2. Enter a target price, choose **Above** or **Below**, and tap **Set
-   Alert**.
-3. The alert is saved in your browser's `localStorage` — it persists
-   across reloads on the same device/browser, but isn't sent anywhere.
-4. When the live price crosses your target, you'll see an on-screen
-   banner, and, if you've granted permission, a browser notification.
-5. Toggle **🔊 Alert Sound** to also play a short tone. Browsers block
-   audio until you've interacted with the page at least once, so the
-   first alert after a fresh page load may be silent if you haven't
-   clicked/tapped anything yet — interacting with any control (like the
-   alert form itself) unlocks audio for the rest of the session.
-6. Tap **Clear** next to the active-alert label to remove it.
+1. Go to github.com, sign in, click **New repository**, name it, and
+   create it (public, no README needed since one is included here).
+2. Click **Add file → Upload files**.
+3. Drag in `index.html`, `README.md`, and the `css/`, `js/`, `assets/`
+   folders together.
+4. Scroll down and click **Commit changes**.
+5. Follow steps 3–6 above to enable Pages.
 
-## 8. How reconnection works
+## 9. Troubleshooting
 
-If the WebSocket disconnects for any reason, the client:
+| Symptom | Likely cause | What to check |
+|---|---|---|
+| Stuck on "CONNECTING" | Network blocks WebSocket connections | Some corporate/school networks block `wss://`; try another network |
+| "Could not reach Hyperliquid to resolve the BTC/USDC market" | The one-time `spotMeta` REST call failed | Check your connection, click **Retry**; if it persists, Hyperliquid's API may be down |
+| Price briefly shows "DISCONNECTED" then recovers | Normal — the staleness watchdog force-reconnects after 15s of silence | No action needed |
+| Alert never fires | Tab was closed or the browser blocked notifications | Keep the tab open; check the site's notification permission |
+| Chart looks empty after switching timeframe | Candle history request failed | An error banner should appear; click **Retry** |
 
-1. Immediately updates the status indicator to `🔴 DISCONNECTED`, then
-   `🟡 RECONNECTING`.
-2. Waits, then retries, following exponential backoff: 1s → 2s → 4s → 8s →
-   16s → 30s (capped).
-3. Re-subscribes to `l2Book`, `trades`, and `candle` for the resolved
-   market as soon as the socket reopens.
-4. Resets the backoff counter back to 1s after a successful reconnect.
-5. Never opens a second, duplicate socket while one is already
-   connecting/open.
+## 10. API limitations
 
-The dashboard only ever shows `🟢 LIVE` once it has received a real,
-validated data message from Hyperliquid — not merely once the socket has
-opened.
-
-## 9. API limitations
-
-- Hyperliquid's public WebSocket enforces per-IP limits on the number of
-  simultaneous subscriptions, connections, and messages — this dashboard
-  uses a small, fixed number of subscriptions (well within those limits)
-  for a single market.
-- `candleSnapshot` only returns the most recent 5,000 candles per request;
-  this dashboard requests a bounded lookback window per timeframe.
-- The spot asset-context response does not include 24h high/low, so those
-  are derived client-side from the last 24 hourly candles rather than
-  provided directly by the API.
-- Latency is only displayed when it can be measured from real message
-  timestamps; if it can't be calculated reliably, it's omitted rather than
-  guessed.
-
-## 10. Security considerations
-
-- **Read-only, always.** This dashboard never requests a wallet
-  connection, private key, or seed phrase, and contains no code path that
-  can sign, place, modify, or cancel an order.
-- **No API key required.** Every endpoint used here is Hyperliquid's
-  public, unauthenticated market-data surface.
-- **No backend, no database, no server-side secrets.** Everything runs in
-  your browser; the only network calls are to `api.hyperliquid.xyz`.
-- **Local-only alert storage.** Your price alert configuration lives in
-  `localStorage` on your device and is never transmitted anywhere.
-- All incoming WebSocket messages are validated before touching the UI —
-  malformed or unexpected payloads are discarded rather than crashing the
-  app.
+- **Public data only.** This app uses no API key and no signed
+  requests, so it's limited to what Hyperliquid's public Info/WebSocket
+  endpoints expose — no user-account data of any kind is requested.
+- **No native 24H high/low endpoint.** Hyperliquid's market-context
+  endpoints expose `markPx`/`midPx`/`prevDayPx`/volume, but not a
+  ready-made 24H high/low, so this app derives them from 1h candles
+  over the trailing 24 hours and extends them live as new ticks arrive.
+- **Rate limits.** Hyperliquid enforces per-IP WebSocket subscription
+  and REST rate limits. This app subscribes to only two channels
+  (`activeAssetCtx` and one `candle` interval at a time) and avoids
+  polling, staying well within normal limits.
+- **Best-effort backfill.** `candleSnapshot` history depth can vary by
+  interval; very long lookbacks on fine intervals may return fewer
+  candles than requested.
 
 ---
 
-Built with vanilla HTML, CSS, and JavaScript, plus
-[Lightweight Charts](https://github.com/tradingview/lightweight-charts)
-(loaded from a public CDN) for the candlestick chart. No frameworks, no
-build step.
+Built with vanilla HTML/CSS/JS + [Lightweight Charts](https://github.com/tradingview/lightweight-charts) (loaded from a CDN). No frameworks, no bundler, no backend.
