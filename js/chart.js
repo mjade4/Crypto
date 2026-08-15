@@ -1,122 +1,103 @@
 /**
  * chart.js
- * Wraps TradingView's Lightweight Charts (loaded from CDN in index.html)
- * to render the BTC/USDC price history and keep it live-updating.
+ * Thin wrapper around TradingView's Lightweight Charts (loaded via CDN in
+ * index.html as the global `LightweightCharts`). Renders BTC/USDC candles
+ * and a live current-price line, and exposes a small update API for app.js.
  */
-const PriceChart = (() => {
-  let chart = null;
-  let areaSeries = null;
-  let priceLine = null;
-  let container = null;
-  let resizeObserver = null;
-  let lastBarTime = null;
 
-  const palette = {
-    up: '#22c99b',
-    down: '#ef5462',
-    line: '#5ad1ac',
-    topFill: 'rgba(90, 209, 172, 0.28)',
-    bottomFill: 'rgba(90, 209, 172, 0.00)',
-    grid: 'rgba(255, 255, 255, 0.045)',
-    text: '#8b939b',
-    crosshair: 'rgba(245, 246, 247, 0.35)',
-  };
+class PriceChart {
+  constructor(containerEl) {
+    this.container = containerEl;
+    this.chart = null;
+    this.series = null;
+    this.priceLine = null;
+    this._lastBarTime = null;
 
-  function init(containerEl) {
-    container = containerEl;
-    chart = LightweightCharts.createChart(container, {
+    this._init();
+    window.addEventListener('resize', () => this._resize());
+  }
+
+  _init() {
+    if (typeof LightweightCharts === 'undefined') {
+      this.container.innerHTML =
+        '<div class="chart-fallback">Chart library failed to load. Check your network connection.</div>';
+      return;
+    }
+
+    this.chart = LightweightCharts.createChart(this.container, {
       layout: {
         background: { type: 'solid', color: 'transparent' },
-        textColor: palette.text,
-        fontFamily: "'JetBrains Mono', 'SFMono-Regular', Menlo, monospace",
+        textColor: '#9aa4b2',
+        fontFamily:
+          "'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
         fontSize: 11,
       },
       grid: {
-        vertLines: { visible: false },
-        horzLines: { color: palette.grid },
+        vertLines: { color: 'rgba(255,255,255,0.04)' },
+        horzLines: { color: 'rgba(255,255,255,0.04)' },
       },
       rightPriceScale: {
-        borderVisible: false,
-        scaleMargins: { top: 0.15, bottom: 0.08 },
+        borderColor: 'rgba(255,255,255,0.08)',
       },
       timeScale: {
-        borderVisible: false,
+        borderColor: 'rgba(255,255,255,0.08)',
         timeVisible: true,
         secondsVisible: false,
       },
       crosshair: {
-        vertLine: { color: palette.crosshair, width: 1, style: 3, labelBackgroundColor: '#1c2024' },
-        horzLine: { color: palette.crosshair, width: 1, style: 3, labelBackgroundColor: '#1c2024' },
+        mode: LightweightCharts.CrosshairMode.Normal,
+        vertLine: { color: 'rgba(255,255,255,0.2)', width: 1, style: 3 },
+        horzLine: { color: 'rgba(255,255,255,0.2)', width: 1, style: 3 },
       },
-      handleScroll: { mouseWheel: false, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
-      handleScale: { mouseWheel: true, pinch: true, axisPressedMouseMove: false },
-      autoSize: false,
-      width: container.clientWidth,
-      height: container.clientHeight,
+      autoSize: true,
     });
 
-    areaSeries = chart.addSeries(LightweightCharts.AreaSeries, {
-      lineColor: palette.line,
-      topColor: palette.topFill,
-      bottomColor: palette.bottomFill,
-      lineWidth: 2,
-      priceLineVisible: false,
-      lastValueVisible: true,
+    this.series = this.chart.addCandlestickSeries({
+      upColor: '#22c55e',
+      downColor: '#ef4444',
+      borderUpColor: '#22c55e',
+      borderDownColor: '#ef4444',
+      wickUpColor: '#22c55e',
+      wickDownColor: '#ef4444',
       priceFormat: { type: 'price', precision: 2, minMove: 0.01 },
     });
-
-    resizeObserver = new ResizeObserver(() => {
-      if (!container) return;
-      chart.applyOptions({ width: container.clientWidth, height: container.clientHeight });
-    });
-    resizeObserver.observe(container);
   }
 
-  function setHistory(candles) {
-    if (!areaSeries) return;
-    const points = candles.map((c) => ({ time: c.time, value: c.close }));
-    areaSeries.setData(points);
-    lastBarTime = points.length ? points[points.length - 1].time : null;
-    if (points.length) chart.timeScale().fitContent();
+  setHistory(candles) {
+    if (!this.series || !candles.length) return;
+    this.series.setData(candles);
+    this._lastBarTime = candles[candles.length - 1].time;
+    this.chart.timeScale().fitContent();
   }
 
-  /** Called on every live candle update for the active interval. */
-  function updateBar(candle) {
-    if (!areaSeries) return;
-    areaSeries.update({ time: candle.time, value: candle.close });
-    lastBarTime = candle.time;
+  updateBar(candle) {
+    if (!this.series) return;
+    this.series.update(candle);
+    this._lastBarTime = candle.time;
   }
 
-  /** Moves the subtle current-price line as fresh ticks stream in. */
-  function updateCurrentPriceLine(price, isUp) {
-    if (!areaSeries) return;
-    if (priceLine) {
-      areaSeries.removePriceLine(priceLine);
-      priceLine = null;
+  setCurrentPriceLine(price) {
+    if (!this.series) return;
+    if (this.priceLine) {
+      this.series.removePriceLine(this.priceLine);
     }
-    priceLine = areaSeries.createPriceLine({
+    this.priceLine = this.series.createPriceLine({
       price,
-      color: isUp ? palette.up : palette.down,
+      color: 'rgba(255,255,255,0.5)',
       lineWidth: 1,
       lineStyle: LightweightCharts.LineStyle.Dashed,
       axisLabelVisible: true,
-      title: 'now',
+      title: '',
     });
   }
 
-  function clear() {
-    if (areaSeries) areaSeries.setData([]);
-    lastBarTime = null;
+  clear() {
+    if (this.series) this.series.setData([]);
+    this._lastBarTime = null;
   }
 
-  function destroy() {
-    if (resizeObserver && container) resizeObserver.unobserve(container);
-    resizeObserver = null;
-    if (chart) chart.remove();
-    chart = null;
-    areaSeries = null;
-    priceLine = null;
+  _resize() {
+    if (!this.chart) return;
+    this.chart.resize(this.container.clientWidth, this.container.clientHeight);
   }
-
-  return { init, setHistory, updateBar, updateCurrentPriceLine, clear, destroy };
-})();
+}

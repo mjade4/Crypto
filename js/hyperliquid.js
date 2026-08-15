@@ -1,299 +1,458 @@
 /**
  * hyperliquid.js
- * All communication with Hyperliquid's public Info API (REST) and
- * WebSocket API lives here. Nothing in this file ever signs a request,
- * places an order, or touches a wallet — it only reads public market data.
  *
- * Public surface (window.Hyperliquid):
- *   resolveMarket()                -> Promise<{ coin, displaySymbol }>
- *   fetchCandles(coin, interval, startMs, endMs) -> Promise<Candle[]>
- *   connect(coin)                  -> starts the live WebSocket feed
- *   disconnect()
- *   setActiveInterval(interval)    -> re-subscribes candle feed on timeframe change
- *   on(event, handler)             -> 'status' | 'price' | 'candle' | 'error'
+ * Encapsulates all communication with Hyperliquid's public market-data API.
+ * Nothing outside this file needs to know about REST payload shapes or the
+ * WebSocket subscription protocol.
+ *
+ * Data source: Hyperliquid (https://hyperliquid.gitbook.io/hyperliquid-docs)
+ *   - Info endpoint (REST):      POST https://api.hyperliquid.xyz/info
+ *   - WebSocket endpoint:        wss://api.hyperliquid.xyz/ws
+ *
+ * This client is strictly READ-ONLY. It never signs anything, never asks
+ * for a wallet, private key, or seed phrase, and never places or manages
+ * orders.
  */
-const Hyperliquid = (() => {
-  const listeners = { status: [], price: [], candle: [], error: [] };
-  let ws = null;
-  let wsConnectAttempted = false;
-  let currentCoin = null;
-  let currentInterval = null;
-  let pingTimer = null;
-  let staleWatchTimer = null;
-  let reconnectTimer = null;
-  let reconnectAttempts = 0;
-  let lastMessageAt = 0;
-  let status = 'disconnected'; // connecting | live | reconnecting | disconnected
 
-  function emit(event, payload) {
-    for (const fn of listeners[event] || []) {
-      try { fn(payload); } catch (e) { console.error(`[Hyperliquid] listener error for ${event}`, e); }
+class HyperliquidClient {
+  /**
+   * @param {Object} handlers
+   * @param {(status: 'connecting'|'live'|'disconnected'|'reconnecting') => void} handlers.onStatusChange
+   * @param {(tick: {price: number, time: number}) => void} handlers.onMids
+   * @param {(book: {bids: Array, asks: Array, time: number}) => void} handlers.onBook
+   * @param {(trades: Array) => void} handlers.onTrades
+   * @param {(candle: Object) => void} handlers.onCandle
+   * @param {(market: {coinId: string, displayName: string, baseName: string}) => void} handlers.onMarketResolved
+   * @param {(message: string) => void} handlers.onError
+   */
+  constructor(handlers = {}) {
+    this.handlers = handlers;
+    this.ws = null;
+    this.coinId = null; // e.g. "@142" — the identifier Hyperliquid expects on the wire
+    this.displayName = CONFIG.FALLBACK_DISPLAY_NAME;
+    this.baseName = 'UBTC';
+    this.currentInterval = CONFIG.DEFAULT_TIMEFRAME;
+
+    this._reconnectAttempt = 0;
+    this._reconnectTimer = null;
+    this._explicitClose = false;
+    this._connectedOnce = false;
+    this._lastMessageAt = 0;
+    this._pingInterval = null;
+    this._stabilityTimer = null;
+    this._lastPingSentAt = null;
+  }
+
+  // ---------------------------------------------------------------------
+  // Market resolution
+  // ---------------------------------------------------------------------
+
+  /**
+   * Determine the exact Hyperliquid spot market identifier for BTC/USDC.
+   * Hyperliquid's own docs state: "coin should be PURR/USDC for PURR, and
+   * @{index} ... where index is the index of the spot pair in the universe
+   * field of the spotMeta response." BTC/USDC (as shown on the Hyperliquid
+   * UI) corresponds to the HyperCore token UBTC paired with USDC. We look
+   * this up dynamically instead of assuming a fixed index, because the
+   * universe can be reordered as new markets are listed.
+   */
+  async resolveMarket() {
+    const meta = await this._postInfo({ type: 'spotMeta' });
+    if (!meta || !Array.isArray(meta.tokens) || !Array.isArray(meta.universe)) {
+      throw new Error('Unexpected spotMeta response shape from Hyperliquid.');
+    }
+
+    let baseToken = null;
+    for (const candidate of CONFIG.BASE_TOKEN_CANDIDATES) {
+      baseToken = meta.tokens.find(
+        (t) => typeof t.name === 'string' && t.name.toUpperCase() === candidate
+      );
+      if (baseToken) break;
+    }
+    if (!baseToken) {
+      throw new Error('Could not find a BTC-backed token in Hyperliquid spotMeta.tokens.');
+    }
+
+    const pair = meta.universe.find((u) => {
+      if (!Array.isArray(u.tokens) || u.tokens.length !== 2) return false;
+      const [base, quote] = u.tokens;
+      return base === baseToken.index && quote === CONFIG.QUOTE_TOKEN_INDEX;
+    });
+    if (!pair) {
+      throw new Error('Could not find a spot universe entry pairing the BTC token with USDC.');
+    }
+
+    // Per docs, PURR/USDC is addressed by name; every other pair is
+    // addressed as "@{universe index}".
+    const coinId = pair.name === 'PURR/USDC' ? pair.name : `@${pair.index}`;
+
+    this.coinId = coinId;
+    this.baseName = baseToken.name;
+    this.displayName = pair.name || `${baseToken.name}/USDC`;
+
+    this.handlers.onMarketResolved?.({
+      coinId: this.coinId,
+      displayName: this.displayName,
+      baseName: this.baseName,
+    });
+
+    return this.coinId;
+  }
+
+  // ---------------------------------------------------------------------
+  // REST: initial snapshot data (used once at load, then WS takes over)
+  // ---------------------------------------------------------------------
+
+  async fetchInitialStats() {
+    const [spotMeta, assetCtxs] = await this._postInfo({ type: 'spotMetaAndAssetCtxs' });
+    if (!Array.isArray(assetCtxs)) throw new Error('Unexpected spotMetaAndAssetCtxs response.');
+
+    const pairIndex = spotMeta.universe.findIndex((u) => {
+      const coinId = u.name === 'PURR/USDC' ? u.name : `@${u.index}`;
+      return coinId === this.coinId;
+    });
+    const ctx = assetCtxs[pairIndex];
+    if (!ctx) throw new Error('Could not locate asset context for the resolved market.');
+
+    return {
+      markPx: this._toNumber(ctx.markPx),
+      midPx: this._toNumber(ctx.midPx),
+      prevDayPx: this._toNumber(ctx.prevDayPx),
+      dayNtlVlm: this._toNumber(ctx.dayNtlVlm), // USDC-denominated 24h volume
+    };
+  }
+
+  /**
+   * Rolling 24h high/low/base-volume, derived from the most recent 24
+   * hourly candles (Hyperliquid's asset-context response has no high/low
+   * fields, so we compute this from real candle data rather than inventing
+   * it).
+   */
+  async fetchRolling24h() {
+    const end = Date.now();
+    const start = end - CONFIG.ROLLING_24H_BARS * 60 * 60 * 1000;
+    const candles = await this.fetchCandles(CONFIG.ROLLING_24H_INTERVAL, start, end);
+    if (!candles.length) return null;
+
+    let high = -Infinity;
+    let low = Infinity;
+    let baseVolume = 0;
+    for (const c of candles) {
+      if (c.high > high) high = c.high;
+      if (c.low < low) low = c.low;
+      baseVolume += c.volume;
+    }
+    return { high, low, baseVolume };
+  }
+
+  /**
+   * Historical OHLCV candles via the candleSnapshot info method.
+   * Returns normalized {time, open, high, low, close, volume} objects,
+   * time in seconds (for charting-library compatibility).
+   */
+  async fetchCandles(interval, startTime, endTime) {
+    const raw = await this._postInfo({
+      type: 'candleSnapshot',
+      req: { coin: this.coinId, interval, startTime, endTime },
+    });
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((c) => this._normalizeCandle(c))
+      .filter((c) => c !== null)
+      .sort((a, b) => a.time - b.time);
+  }
+
+  _normalizeCandle(c) {
+    if (!c || typeof c.t !== 'number') return null;
+    const open = this._toNumber(c.o);
+    const high = this._toNumber(c.h);
+    const low = this._toNumber(c.l);
+    const close = this._toNumber(c.c);
+    const volume = this._toNumber(c.v);
+    if ([open, high, low, close].some((v) => v === null || Number.isNaN(v))) return null;
+    return { time: Math.floor(c.t / 1000), open, high, low, close, volume: volume || 0 };
+  }
+
+  // ---------------------------------------------------------------------
+  // WebSocket lifecycle
+  // ---------------------------------------------------------------------
+
+  connect() {
+    if (!this.coinId) {
+      this.handlers.onError?.('Cannot connect: market has not been resolved yet.');
+      return;
+    }
+    this._explicitClose = false;
+    this._openSocket();
+  }
+
+  disconnect() {
+    this._explicitClose = true;
+    this._clearReconnectTimer();
+    this._clearPing();
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch (_) {
+        /* no-op */
+      }
+      this.ws = null;
     }
   }
 
-  function on(event, handler) {
-    if (!listeners[event]) listeners[event] = [];
-    listeners[event].push(handler);
+  setCandleInterval(interval) {
+    const isValid = CONFIG.TIMEFRAMES.some((tf) => tf.key === interval);
+    if (!isValid) return;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this._unsubscribe({ type: 'candle', coin: this.coinId, interval: this.currentInterval });
+      this.currentInterval = interval;
+      this._subscribe({ type: 'candle', coin: this.coinId, interval: this.currentInterval });
+    } else {
+      this.currentInterval = interval;
+    }
   }
 
-  function setStatus(next) {
-    if (status === next) return;
-    status = next;
-    emit('status', status);
+  _openSocket() {
+    this._setStatus(this._connectedOnce ? 'reconnecting' : 'connecting');
+
+    let socket;
+    try {
+      socket = new WebSocket(CONFIG.WS_URL);
+    } catch (err) {
+      this.handlers.onError?.('Failed to open WebSocket: ' + err.message);
+      this._scheduleReconnect();
+      return;
+    }
+    this.ws = socket;
+
+    socket.addEventListener('open', () => {
+      this._reconnectAttempt = 0;
+      this._connectedOnce = true;
+      this._lastMessageAt = Date.now();
+      this._restoreSubscriptions();
+      this._startPing();
+      // Consider the connection "LIVE" once we've successfully subscribed;
+      // status flips to live on the first valid data message (see
+      // _handleMessage) so we never claim LIVE before real data arrives.
+    });
+
+    socket.addEventListener('message', (event) => this._handleMessage(event));
+
+    socket.addEventListener('close', () => {
+      this._clearPing();
+      if (!this._explicitClose) {
+        this._setStatus('disconnected');
+        this._scheduleReconnect();
+      }
+    });
+
+    socket.addEventListener('error', () => {
+      // The subsequent 'close' event drives reconnect logic; this just
+      // surfaces a message for diagnostics.
+      this.handlers.onError?.('WebSocket error.');
+    });
+  }
+
+  _restoreSubscriptions() {
+    this._subscribe({ type: 'l2Book', coin: this.coinId });
+    this._subscribe({ type: 'trades', coin: this.coinId });
+    this._subscribe({ type: 'candle', coin: this.coinId, interval: this.currentInterval });
+  }
+
+  _subscribe(subscription) {
+    this._send({ method: 'subscribe', subscription });
+  }
+
+  _unsubscribe(subscription) {
+    this._send({ method: 'unsubscribe', subscription });
+  }
+
+  _send(payload) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(payload));
+    }
+  }
+
+  _startPing() {
+    this._clearPing();
+    // Hyperliquid recommends clients keep connections alive; a lightweight
+    // ping method call also lets us detect silently-dead sockets.
+    this._pingInterval = setInterval(() => {
+      this._lastPingSentAt = Date.now();
+      this._send({ method: 'ping' });
+      const idleMs = Date.now() - this._lastMessageAt;
+      if (idleMs > 45000 && this.ws) {
+        try {
+          this.ws.close();
+        } catch (_) {
+          /* no-op */
+        }
+      }
+    }, 15000);
+  }
+
+  _clearPing() {
+    if (this._pingInterval) {
+      clearInterval(this._pingInterval);
+      this._pingInterval = null;
+    }
+  }
+
+  _scheduleReconnect() {
+    if (this._explicitClose) return;
+    this._clearReconnectTimer();
+    const delays = CONFIG.RECONNECT_DELAYS_MS;
+    const delay = delays[Math.min(this._reconnectAttempt, delays.length - 1)];
+    this._reconnectAttempt += 1;
+    this._setStatus('reconnecting');
+    this._reconnectTimer = setTimeout(() => {
+      if (!this._explicitClose) this._openSocket();
+    }, delay);
+  }
+
+  _clearReconnectTimer() {
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+  }
+
+  _setStatus(status) {
+    this.handlers.onStatusChange?.(status);
   }
 
   // ---------------------------------------------------------------------
-  // REST: /info
+  // Message handling + validation
   // ---------------------------------------------------------------------
-  async function infoRequest(body) {
-    const res = await fetch(CONFIG.REST_URL, {
+
+  _handleMessage(event) {
+    this._lastMessageAt = Date.now();
+
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch (_) {
+      return; // malformed JSON — ignore, never crash
+    }
+    if (!msg || typeof msg !== 'object' || typeof msg.channel !== 'string') return;
+
+    switch (msg.channel) {
+      case 'subscriptionResponse':
+        // Acknowledgement only; once we're subscribed and start receiving
+        // real channel data below we flip to LIVE.
+        return;
+
+      case 'pong':
+        if (this._lastPingSentAt) {
+          const rtt = Date.now() - this._lastPingSentAt;
+          this._lastPingSentAt = null;
+          if (rtt >= 0 && rtt < 30000) this.handlers.onLatency?.(rtt);
+        }
+        return;
+
+      case 'allMids':
+        this._handleMids(msg.data);
+        return;
+
+      case 'l2Book':
+        this._handleBook(msg.data);
+        return;
+
+      case 'trades':
+        this._handleTrades(msg.data);
+        return;
+
+      case 'candle':
+        this._handleCandle(msg.data);
+        return;
+
+      case 'error':
+        this.handlers.onError?.(typeof msg.data === 'string' ? msg.data : 'Hyperliquid WS error.');
+        return;
+
+      default:
+        return; // unhandled/irrelevant channel — ignore safely
+    }
+  }
+
+  _handleMids(data) {
+    if (!data || typeof data.mids !== 'object') return;
+    const raw = data.mids[this.coinId];
+    const price = this._toNumber(raw);
+    if (price === null || !Number.isFinite(price) || price <= 0) return;
+    this._setStatus('live');
+    this.handlers.onMids?.({ price, time: Date.now() });
+  }
+
+  _handleBook(data) {
+    if (!data || !Array.isArray(data.levels) || data.levels.length !== 2) return;
+    const [bidLevels, askLevels] = data.levels;
+    if (!Array.isArray(bidLevels) || !Array.isArray(askLevels)) return;
+
+    const normalize = (levels) =>
+      levels
+        .map((lvl) => ({
+          price: this._toNumber(lvl.px),
+          size: this._toNumber(lvl.sz),
+        }))
+        .filter((lvl) => lvl.price !== null && lvl.size !== null);
+
+    const bids = normalize(bidLevels);
+    const asks = normalize(askLevels);
+    if (!bids.length && !asks.length) return;
+
+    this._setStatus('live');
+    this.handlers.onBook?.({
+      bids,
+      asks,
+      time: typeof data.time === 'number' ? data.time : Date.now(),
+    });
+  }
+
+  _handleTrades(data) {
+    if (!Array.isArray(data) || !data.length) return;
+    const trades = data
+      .map((t) => ({
+        price: this._toNumber(t.px),
+        size: this._toNumber(t.sz),
+        side: t.side === 'B' ? 'buy' : t.side === 'A' ? 'sell' : null,
+        time: typeof t.time === 'number' ? t.time : null,
+      }))
+      .filter((t) => t.price !== null && t.size !== null && t.time !== null);
+    if (!trades.length) return;
+
+    this._setStatus('live');
+    this.handlers.onTrades?.(trades);
+  }
+
+  _handleCandle(data) {
+    const candle = this._normalizeCandle(data);
+    if (!candle) return;
+    // Only forward candles for the interval we're currently displaying.
+    if (data.i !== this.currentInterval) return;
+    this._setStatus('live');
+    this.handlers.onCandle?.(candle);
+  }
+
+  // ---------------------------------------------------------------------
+  // REST helper
+  // ---------------------------------------------------------------------
+
+  async _postInfo(body) {
+    const res = await fetch(CONFIG.INFO_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
     if (!res.ok) {
-      throw new Error(`Hyperliquid /info ${body.type} failed: HTTP ${res.status}`);
+      throw new Error(`Hyperliquid info request failed: HTTP ${res.status}`);
     }
     return res.json();
   }
 
-  /**
-   * Determines the exact Hyperliquid spot market identifier for BTC/USDC
-   * by reading the live spotMeta universe rather than assuming an index.
-   * On HyperCore, the pair displayed as "BTC/USDC" in Hyperliquid's own UI
-   * is backed by the token "UBTC" quoted in USDC.
-   */
-  async function resolveMarket() {
-    const meta = await infoRequest({ type: 'spotMeta' });
-    if (!meta || !Array.isArray(meta.tokens) || !Array.isArray(meta.universe)) {
-      throw new Error('Unexpected spotMeta response shape from Hyperliquid');
-    }
-
-    const baseToken = meta.tokens.find(
-      (t) => (t.name || '').toUpperCase() === CONFIG.BASE_TOKEN_NAME.toUpperCase()
-    );
-    const quoteToken = meta.tokens.find(
-      (t) => (t.name || '').toUpperCase() === CONFIG.QUOTE_TOKEN_NAME.toUpperCase()
-    );
-
-    if (!baseToken || !quoteToken) {
-      throw new Error('Could not locate UBTC or USDC token in Hyperliquid spotMeta');
-    }
-
-    const pair = meta.universe.find(
-      (u) => Array.isArray(u.tokens) && u.tokens[0] === baseToken.index && u.tokens[1] === quoteToken.index
-    );
-
-    if (!pair) {
-      throw new Error('Could not locate UBTC/USDC pair in Hyperliquid spotMeta universe');
-    }
-
-    // PURR/USDC is the sole pair addressed by name; every other spot pair,
-    // including this one, is addressed as "@<universe index>".
-    const coin = `@${pair.index}`;
-    return { coin, displaySymbol: CONFIG.DISPLAY_SYMBOL, rawPairName: pair.name };
+  _toNumber(v) {
+    if (v === null || v === undefined) return null;
+    const n = typeof v === 'number' ? v : parseFloat(v);
+    return Number.isFinite(n) ? n : null;
   }
-
-  /**
-   * Pulls OHLC candles for a coin/interval over [startMs, endMs].
-   * Used for: seeding the chart on load/timeframe-switch, and computing
-   * the rolling 24H HIGH / 24H LOW stat.
-   */
-  async function fetchCandles(coin, interval, startMs, endMs) {
-    const data = await infoRequest({
-      type: 'candleSnapshot',
-      req: { coin, interval, startTime: startMs, endTime: endMs },
-    });
-    if (!Array.isArray(data)) return [];
-    return data.map((c) => ({
-      time: Math.floor(c.t / 1000), // seconds, for the chart library
-      open: Number(c.o),
-      high: Number(c.h),
-      low: Number(c.l),
-      close: Number(c.c),
-      volume: Number(c.v),
-    }));
-  }
-
-  // ---------------------------------------------------------------------
-  // WebSocket
-  // ---------------------------------------------------------------------
-  function clearTimers() {
-    if (pingTimer) clearInterval(pingTimer);
-    if (staleWatchTimer) clearInterval(staleWatchTimer);
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    pingTimer = staleWatchTimer = reconnectTimer = null;
-  }
-
-  function send(obj) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(obj));
-    }
-  }
-
-  function subscribeAll() {
-    if (!currentCoin) return;
-    send({ method: 'subscribe', subscription: { type: 'activeAssetCtx', coin: currentCoin } });
-    if (currentInterval) {
-      send({ method: 'subscribe', subscription: { type: 'candle', coin: currentCoin, interval: currentInterval } });
-    }
-  }
-
-  function unsubscribeCandle(interval) {
-    if (!currentCoin || !interval) return;
-    send({ method: 'unsubscribe', subscription: { type: 'candle', coin: currentCoin, interval } });
-  }
-
-  function setActiveInterval(interval) {
-    if (interval === currentInterval) return;
-    const prev = currentInterval;
-    currentInterval = interval;
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      if (prev) unsubscribeCandle(prev);
-      send({ method: 'subscribe', subscription: { type: 'candle', coin: currentCoin, interval } });
-    }
-  }
-
-  function scheduleReconnect() {
-    if (reconnectTimer) return; // already scheduled
-    setStatus('reconnecting');
-    const backoff = Math.min(
-      CONFIG.WS_RECONNECT_BASE_MS * Math.pow(2, reconnectAttempts),
-      CONFIG.WS_RECONNECT_MAX_MS
-    );
-    const jitter = Math.floor(Math.random() * CONFIG.WS_RECONNECT_JITTER_MS);
-    const delay = backoff + jitter;
-    reconnectAttempts += 1;
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      openSocket();
-    }, delay);
-  }
-
-  function handleMessage(raw) {
-    lastMessageAt = Date.now();
-    let msg;
-    try {
-      msg = JSON.parse(raw.data);
-    } catch (e) {
-      return; // ignore malformed frames rather than crashing the app
-    }
-
-    const channel = msg.channel;
-
-    if (channel === 'pong' || channel === 'subscriptionResponse') {
-      // Any traffic counts as evidence of a live connection.
-      if (status !== 'live') setStatus('live');
-      return;
-    }
-
-    if (channel === 'activeAssetCtx' || channel === 'activeSpotAssetCtx') {
-      setStatus('live');
-      const data = msg.data || {};
-      const ctx = data.ctx || {};
-      emit('price', {
-        coin: data.coin,
-        markPx: ctx.markPx != null ? Number(ctx.markPx) : null,
-        midPx: ctx.midPx != null ? Number(ctx.midPx) : null,
-        prevDayPx: ctx.prevDayPx != null ? Number(ctx.prevDayPx) : null,
-        dayNtlVlm: ctx.dayNtlVlm != null ? Number(ctx.dayNtlVlm) : null,
-        dayBaseVlm: ctx.dayBaseVlm != null ? Number(ctx.dayBaseVlm) : null,
-        receivedAt: lastMessageAt,
-      });
-      return;
-    }
-
-    if (channel === 'candle') {
-      setStatus('live');
-      const c = msg.data;
-      if (!c) return;
-      emit('candle', {
-        time: Math.floor(c.t / 1000),
-        open: Number(c.o),
-        high: Number(c.h),
-        low: Number(c.l),
-        close: Number(c.c),
-        volume: Number(c.v),
-        interval: c.i,
-      });
-      return;
-    }
-
-    if (channel === 'error') {
-      emit('error', msg.data || 'Hyperliquid WebSocket reported an error');
-    }
-  }
-
-  function openSocket() {
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-      return; // never allow more than one simultaneous connection
-    }
-    wsConnectAttempted = true;
-    setStatus(reconnectAttempts > 0 ? 'reconnecting' : 'connecting');
-
-    try {
-      ws = new WebSocket(CONFIG.WS_URL);
-    } catch (e) {
-      emit('error', 'Unable to open Hyperliquid WebSocket');
-      scheduleReconnect();
-      return;
-    }
-
-    ws.addEventListener('open', () => {
-      reconnectAttempts = 0;
-      lastMessageAt = Date.now();
-      subscribeAll();
-
-      pingTimer = setInterval(() => send({ method: 'ping' }), CONFIG.WS_PING_INTERVAL_MS);
-
-      staleWatchTimer = setInterval(() => {
-        if (Date.now() - lastMessageAt > CONFIG.WS_STALE_AFTER_MS) {
-          // No data for too long — don't keep claiming LIVE. Force a clean
-          // reconnect so subscriptions are guaranteed fresh.
-          setStatus('disconnected');
-          try { ws.close(); } catch (e) { /* no-op */ }
-        }
-      }, 5000);
-    });
-
-    ws.addEventListener('message', handleMessage);
-
-    ws.addEventListener('close', () => {
-      clearTimers();
-      setStatus('disconnected');
-      scheduleReconnect();
-    });
-
-    ws.addEventListener('error', () => {
-      emit('error', 'Hyperliquid WebSocket connection error');
-      try { ws.close(); } catch (e) { /* the close handler drives reconnection */ }
-    });
-  }
-
-  function connect(coin) {
-    currentCoin = coin;
-    if (!currentInterval) currentInterval = CONFIG.TIMEFRAMES[0].interval;
-    reconnectAttempts = 0;
-    openSocket();
-  }
-
-  function disconnect() {
-    clearTimers();
-    if (ws) {
-      ws.removeEventListener('message', handleMessage);
-      try { ws.close(); } catch (e) { /* no-op */ }
-    }
-    ws = null;
-    setStatus('disconnected');
-  }
-
-  return {
-    on,
-    resolveMarket,
-    fetchCandles,
-    connect,
-    disconnect,
-    setActiveInterval,
-    getStatus: () => status,
-  };
-})();
+}

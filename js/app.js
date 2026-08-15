@@ -1,396 +1,486 @@
 /**
  * app.js
- * Ties Hyperliquid data, the chart, and the alert module to the DOM.
- * This is the only file that touches document.* directly.
+ * Wires HyperliquidClient + PriceChart + AlertManager to the DOM.
+ * No trading logic, no wallet, no private keys — purely a read-only viewer.
  */
-(() => {
+
+(function () {
   'use strict';
 
-  const els = {
-    symbolBadge: document.getElementById('symbol-badge'),
-    statusDot: document.getElementById('status-dot'),
-    statusText: document.getElementById('status-text'),
-    price: document.getElementById('price'),
-    changeAbs: document.getElementById('change-abs'),
-    changePct: document.getElementById('change-pct'),
-    high: document.getElementById('stat-high'),
-    low: document.getElementById('stat-low'),
-    volume: document.getElementById('stat-volume'),
-    changeAbsStat: document.getElementById('stat-change-abs'),
-    changePctStat: document.getElementById('stat-change-pct'),
-    lastUpdated: document.getElementById('last-updated'),
-    chartContainer: document.getElementById('chart'),
-    timeframeBar: document.getElementById('timeframe-bar'),
-    errorBanner: document.getElementById('error-banner'),
-    errorBannerText: document.getElementById('error-banner-text'),
-    retryButton: document.getElementById('retry-button'),
-    alertForm: document.getElementById('alert-form'),
-    alertPriceInput: document.getElementById('alert-price'),
-    alertCondition: document.getElementById('alert-condition'),
-    alertActive: document.getElementById('alert-active'),
-    alertActiveText: document.getElementById('alert-active-text'),
-    alertToggle: document.getElementById('alert-toggle'),
-    alertDelete: document.getElementById('alert-delete'),
-    alertFired: document.getElementById('alert-fired'),
-    alertFiredText: document.getElementById('alert-fired-text'),
-    alertFiredClose: document.getElementById('alert-fired-close'),
+  // ---------------------------------------------------------------------
+  // DOM refs
+  // ---------------------------------------------------------------------
+  const el = {
+    pairName: document.getElementById('pairName'),
+    statusPill: document.getElementById('statusPill'),
+    statusLabel: document.getElementById('statusLabel'),
+
+    heroPrice: document.getElementById('heroPrice'),
+    heroChange: document.getElementById('heroChange'),
+    heroChangeAbs: document.getElementById('heroChangeAbs'),
+    heroChangePct: document.getElementById('heroChangePct'),
+
+    statLast: document.getElementById('statLast'),
+    statChangeAbs: document.getElementById('statChangeAbs'),
+    statChangePct: document.getElementById('statChangePct'),
+    statHigh: document.getElementById('statHigh'),
+    statLow: document.getElementById('statLow'),
+    statVolume: document.getElementById('statVolume'),
+    statVolumeLabel: document.getElementById('statVolumeLabel'),
+
+    timeframes: document.getElementById('timeframes'),
+    chartContainer: document.getElementById('chartContainer'),
+
+    asksList: document.getElementById('asksList'),
+    bidsList: document.getElementById('bidsList'),
+
+    bidValue: document.getElementById('bidValue'),
+    askValue: document.getElementById('askValue'),
+    spreadValue: document.getElementById('spreadValue'),
+    spreadPctValue: document.getElementById('spreadPctValue'),
+
+    tradesList: document.getElementById('tradesList'),
+
+    alertForm: document.getElementById('alertForm'),
+    alertPrice: document.getElementById('alertPrice'),
+    alertDirection: document.getElementById('alertDirection'),
+    activeAlertLabel: document.getElementById('activeAlertLabel'),
+    clearAlertBtn: document.getElementById('clearAlertBtn'),
+    soundToggle: document.getElementById('soundToggle'),
+
+    detailsToggle: document.getElementById('detailsToggle'),
+    detailsBody: document.getElementById('detailsBody'),
+    dSymbol: document.getElementById('dSymbol'),
+    dPrice: document.getElementById('dPrice'),
+    dBid: document.getElementById('dBid'),
+    dAsk: document.getElementById('dAsk'),
+    dSpread: document.getElementById('dSpread'),
+    dVolume: document.getElementById('dVolume'),
+    dHigh: document.getElementById('dHigh'),
+    dLow: document.getElementById('dLow'),
+    dUpdate: document.getElementById('dUpdate'),
+    dStatus: document.getElementById('dStatus'),
+
+    footerWs: document.getElementById('footerWs'),
+    footerUpdate: document.getElementById('footerUpdate'),
+    footerLatency: document.getElementById('footerLatency'),
+
+    toast: document.getElementById('alertToast'),
+    toastBody: document.getElementById('toastBody'),
+    toastClose: document.getElementById('toastClose'),
   };
 
+  // ---------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------
   const state = {
-    coin: null,
-    interval: null,
-    timeframeId: CONFIG.DEFAULT_TIMEFRAME,
     lastPrice: null,
-    prevDayPx: null,
-    dayHigh: null,
-    dayLow: null,
-    dayVolume: null,
-    lastMessageAt: null,
-    statsTimer: null,
-    tickTimer: null,
+    prevPrice: null,
+    prevDayPx: null,   // 24h-ago reference price, from Hyperliquid
+    high24h: null,
+    low24h: null,
+    volumeUsdc24h: null, // dayNtlVlm (USDC-denominated)
+    baseVolume24h: null, // sum of candle base-asset volume
+    bestBid: null,
+    bestAsk: null,
+    currentInterval: localStorage.getItem(CONFIG.STORAGE_KEYS.TIMEFRAME) || CONFIG.DEFAULT_TIMEFRAME,
+    wsStatus: 'connecting',
   };
 
-  // ------------------------------------------------------------------
+  // ---------------------------------------------------------------------
   // Formatting helpers
-  // ------------------------------------------------------------------
-  function decimalsFor(value) {
-    if (value == null || !isFinite(value)) return 2;
-    return value >= 1 ? 2 : 6;
+  // ---------------------------------------------------------------------
+
+  function formatPrice(value, opts = {}) {
+    if (value === null || value === undefined || Number.isNaN(value)) return '—';
+    const decimals = value >= 1000 ? 2 : value >= 1 ? 2 : 4;
+    return (
+      (opts.sign && value > 0 ? '+' : '') +
+      '$' +
+      value.toLocaleString('en-US', {
+        minimumFractionDigits: decimals,
+        maximumFractionDigits: decimals,
+      })
+    );
   }
 
-  function formatUsd(value, opts = {}) {
-    if (value == null || !isFinite(value)) return '—';
-    const decimals = opts.decimals ?? decimalsFor(value);
-    return value.toLocaleString('en-US', {
-      minimumFractionDigits: decimals,
-      maximumFractionDigits: decimals,
-    });
-  }
-
-  function formatSigned(value, decimals) {
-    if (value == null || !isFinite(value)) return '—';
-    const sign = value > 0 ? '+' : value < 0 ? '\u2212' : '';
-    return `${sign}${formatUsd(Math.abs(value), { decimals })}`;
+  function formatSignedPrice(value) {
+    if (value === null || value === undefined || Number.isNaN(value)) return '—';
+    const sign = value > 0 ? '+' : value < 0 ? '-' : '';
+    return sign + '$' + Math.abs(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   }
 
   function formatPct(value) {
-    if (value == null || !isFinite(value)) return '—';
-    const sign = value > 0 ? '+' : value < 0 ? '\u2212' : '';
-    return `${sign}${Math.abs(value).toFixed(2)}%`;
+    if (value === null || value === undefined || Number.isNaN(value)) return '—';
+    const sign = value > 0 ? '+' : value < 0 ? '-' : '';
+    return sign + Math.abs(value).toFixed(2) + '%';
   }
 
-  function formatVolume(value) {
-    if (value == null || !isFinite(value)) return '—';
-    const abs = Math.abs(value);
-    if (abs >= 1e9) return `$${(value / 1e9).toFixed(2)}B`;
-    if (abs >= 1e6) return `$${(value / 1e6).toFixed(2)}M`;
-    if (abs >= 1e3) return `$${(value / 1e3).toFixed(2)}K`;
-    return `$${formatUsd(value)}`;
+  function formatSize(value, decimals = 5) {
+    if (value === null || value === undefined || Number.isNaN(value)) return '—';
+    return value.toFixed(decimals);
   }
 
-  function setMovementClass(el, delta) {
-    el.classList.remove('is-up', 'is-down', 'is-flat');
-    if (delta > 0) el.classList.add('is-up');
-    else if (delta < 0) el.classList.add('is-down');
-    else el.classList.add('is-flat');
+  function formatCompactUsd(value) {
+    if (value === null || value === undefined || Number.isNaN(value)) return '—';
+    if (value >= 1e9) return '$' + (value / 1e9).toFixed(2) + 'B';
+    if (value >= 1e6) return '$' + (value / 1e6).toFixed(2) + 'M';
+    if (value >= 1e3) return '$' + (value / 1e3).toFixed(2) + 'K';
+    return '$' + value.toFixed(2);
   }
 
-  // ------------------------------------------------------------------
-  // Connection status
-  // ------------------------------------------------------------------
-  const STATUS_COPY = {
-    connecting: { text: 'CONNECTING', cls: 'is-connecting' },
-    live: { text: 'LIVE', cls: 'is-live' },
-    reconnecting: { text: 'RECONNECTING', cls: 'is-connecting' },
-    disconnected: { text: 'DISCONNECTED', cls: 'is-disconnected' },
+  function formatTime(ms) {
+    if (!ms) return '—';
+    const d = new Date(ms);
+    return d.toLocaleTimeString('en-US', { hour12: false });
+  }
+
+  function dirFromDelta(delta) {
+    if (delta > 0) return 'up';
+    if (delta < 0) return 'down';
+    return 'flat';
+  }
+
+  // ---------------------------------------------------------------------
+  // Status / connection UI
+  // ---------------------------------------------------------------------
+
+  const STATUS_LABELS = {
+    connecting: '🟡 CONNECTING',
+    live: '🟢 LIVE',
+    disconnected: '🔴 DISCONNECTED',
+    reconnecting: '🟡 RECONNECTING',
   };
 
-  function renderStatus(status) {
-    const copy = STATUS_COPY[status] || STATUS_COPY.disconnected;
-    els.statusDot.className = `status-dot ${copy.cls}`;
-    els.statusText.textContent = copy.text;
-    els.statusText.className = `status-text ${copy.cls}`;
+  function setStatus(status) {
+    state.wsStatus = status;
+    el.statusPill.dataset.state = status;
+    el.statusLabel.textContent = STATUS_LABELS[status] || status.toUpperCase();
+    el.footerWs.textContent = 'WebSocket: ' + (status === 'live' ? 'Connected' : status[0].toUpperCase() + status.slice(1));
+    el.dStatus.textContent = STATUS_LABELS[status] || status;
   }
 
-  // ------------------------------------------------------------------
+  // ---------------------------------------------------------------------
   // Price + stats rendering
-  // ------------------------------------------------------------------
-  function renderPrice(price, prevPrice) {
-    const decimals = decimalsFor(price);
-    els.price.textContent = `$${formatUsd(price, { decimals })}`;
-    if (prevPrice != null && price !== prevPrice) {
-      const el = els.price;
-      el.classList.remove('flash-up', 'flash-down');
-      // Force reflow so the animation can restart on rapid consecutive ticks.
-      void el.offsetWidth;
-      el.classList.add(price > prevPrice ? 'flash-up' : 'flash-down');
-      setTimeout(() => el.classList.remove('flash-up', 'flash-down'), CONFIG.PRICE_FLASH_MS);
+  // ---------------------------------------------------------------------
+
+  function renderPrice(price, tsMs) {
+    state.prevPrice = state.lastPrice;
+    state.lastPrice = price;
+
+    el.heroPrice.textContent = formatPrice(price);
+    el.statLast.textContent = formatPrice(price);
+    el.dPrice.textContent = formatPrice(price);
+
+    if (state.prevPrice !== null && price !== state.prevPrice) {
+      const cls = price > state.prevPrice ? 'flash-up' : 'flash-down';
+      el.heroPrice.classList.remove('flash-up', 'flash-down');
+      // reflow to restart animation
+      void el.heroPrice.offsetWidth;
+      el.heroPrice.classList.add(cls);
+      setTimeout(() => el.heroPrice.classList.remove(cls), CONFIG.FLASH_DURATION_MS);
     }
+
+    renderChange();
+    updateFooterTime(tsMs);
+    chart.setCurrentPriceLine(price);
+    alertManager.checkPrice(price);
   }
 
   function renderChange() {
-    if (state.lastPrice == null || state.prevDayPx == null) return;
+    if (state.lastPrice === null || state.prevDayPx === null) return;
     const abs = state.lastPrice - state.prevDayPx;
     const pct = (abs / state.prevDayPx) * 100;
+    const dir = dirFromDelta(abs);
 
-    els.changeAbs.textContent = formatSigned(abs, decimalsFor(state.lastPrice));
-    els.changePct.textContent = formatPct(pct);
-    setMovementClass(els.changeAbs, abs);
-    setMovementClass(els.changePct, abs);
+    el.heroChangeAbs.textContent = formatSignedPrice(abs);
+    el.heroChangePct.textContent = formatPct(pct);
+    el.heroChange.dataset.dir = dir;
 
-    els.changeAbsStat.textContent = formatSigned(abs, decimalsFor(state.lastPrice));
-    els.changePctStat.textContent = formatPct(pct);
-    setMovementClass(els.changeAbsStat, abs);
-    setMovementClass(els.changePctStat, abs);
+    el.statChangeAbs.textContent = formatSignedPrice(abs);
+    el.statChangeAbs.dataset.dir = dir;
+    el.statChangePct.textContent = formatPct(pct);
+    el.statChangePct.dataset.dir = dir;
   }
 
-  function renderStats() {
-    els.high.textContent = state.dayHigh != null ? `$${formatUsd(state.dayHigh, { decimals: decimalsFor(state.dayHigh) })}` : '—';
-    els.low.textContent = state.dayLow != null ? `$${formatUsd(state.dayLow, { decimals: decimalsFor(state.dayLow) })}` : '—';
-    els.volume.textContent = formatVolume(state.dayVolume);
-  }
+  function renderStaticStats() {
+    el.statHigh.textContent = formatPrice(state.high24h);
+    el.statLow.textContent = formatPrice(state.low24h);
+    el.dHigh.textContent = formatPrice(state.high24h);
+    el.dLow.textContent = formatPrice(state.low24h);
 
-  function renderLastUpdated() {
-    if (!state.lastMessageAt) {
-      els.lastUpdated.textContent = 'Waiting for data…';
-      els.lastUpdated.classList.remove('is-stale');
-      return;
-    }
-    const seconds = Math.max(0, Math.round((Date.now() - state.lastMessageAt) / 1000));
-    const stale = Date.now() - state.lastMessageAt > CONFIG.STALE_LABEL_AFTER_MS;
-    els.lastUpdated.classList.toggle('is-stale', stale);
-    if (stale) {
-      els.lastUpdated.textContent = `Data stale — last update ${seconds}s ago`;
-    } else if (seconds < 2) {
-      els.lastUpdated.textContent = 'Updated just now';
-    } else {
-      els.lastUpdated.textContent = `Updated ${seconds}s ago`;
+    if (state.volumeUsdc24h !== null) {
+      el.statVolume.textContent = formatCompactUsd(state.volumeUsdc24h);
+      el.statVolumeLabel.textContent = '24H VOLUME (USDC)';
+      el.dVolume.textContent = formatCompactUsd(state.volumeUsdc24h) + ' USDC';
+    } else if (state.baseVolume24h !== null) {
+      el.statVolume.textContent = state.baseVolume24h.toFixed(2) + ' BTC';
+      el.statVolumeLabel.textContent = '24H VOLUME (BTC)';
+      el.dVolume.textContent = state.baseVolume24h.toFixed(4) + ' BTC';
     }
   }
 
-  // ------------------------------------------------------------------
-  // Error banner
-  // ------------------------------------------------------------------
-  function showError(message) {
-    els.errorBannerText.textContent = message;
-    els.errorBanner.hidden = false;
+  function updateFooterTime(tsMs) {
+    const t = tsMs || Date.now();
+    el.footerUpdate.textContent = 'Last Update: ' + formatTime(t);
+    el.dUpdate.textContent = formatTime(t);
   }
 
-  function hideError() {
-    els.errorBanner.hidden = true;
+  // ---------------------------------------------------------------------
+  // Order book rendering
+  // ---------------------------------------------------------------------
+
+  function renderBook({ bids, asks }) {
+    const N = CONFIG.ORDER_BOOK_LEVELS;
+    // Bids arrive best-first (highest price first) — keep as-is so the best
+    // bid sits at the top of the bids block, nearest the spread.
+    const topBids = bids.slice(0, N);
+    // Asks arrive best-first (lowest price first) — reverse so the worst
+    // (highest) ask is at the top and the best ask sits at the bottom,
+    // nearest the spread, matching a standard order-book layout.
+    const topAsks = asks.slice(0, N).slice().reverse();
+
+    el.asksList.innerHTML = topAsks
+      .map((lvl) => rowHtml(lvl, 'ask'))
+      .join('');
+    el.bidsList.innerHTML = topBids
+      .map((lvl) => rowHtml(lvl, 'bid'))
+      .join('');
+
+    const bestBid = bids[0]?.price ?? null;
+    const bestAsk = asks[0]?.price ?? null;
+    state.bestBid = bestBid;
+    state.bestAsk = bestAsk;
+
+    el.bidValue.textContent = formatPrice(bestBid);
+    el.askValue.textContent = formatPrice(bestAsk);
+    el.dBid.textContent = formatPrice(bestBid);
+    el.dAsk.textContent = formatPrice(bestAsk);
+
+    if (bestBid !== null && bestAsk !== null) {
+      const spread = bestAsk - bestBid;
+      const spreadPct = (spread / bestAsk) * 100;
+      el.spreadValue.textContent = formatSignedPrice(spread).replace('+', '');
+      el.spreadPctValue.textContent = spreadPct.toFixed(3) + '%';
+      el.dSpread.textContent = formatSignedPrice(spread).replace('+', '') + ' (' + spreadPct.toFixed(3) + '%)';
+    }
   }
 
-  // ------------------------------------------------------------------
-  // Timeframes
-  // ------------------------------------------------------------------
-  function getTimeframe(id) {
-    return CONFIG.TIMEFRAMES.find((tf) => tf.id === id) || CONFIG.TIMEFRAMES[0];
+  function rowHtml(lvl, side) {
+    return (
+      '<div class="ob-row ob-row--' +
+      side +
+      '"><span>' +
+      formatPrice(lvl.price) +
+      '</span><span>' +
+      formatSize(lvl.size) +
+      '</span></div>'
+    );
   }
 
-  function renderTimeframeButtons() {
-    [...els.timeframeBar.querySelectorAll('button')].forEach((btn) => {
-      btn.classList.toggle('is-active', btn.dataset.tf === state.timeframeId);
-      btn.setAttribute('aria-pressed', String(btn.dataset.tf === state.timeframeId));
+  // ---------------------------------------------------------------------
+  // Trades rendering
+  // ---------------------------------------------------------------------
+
+  function renderTrades(trades) {
+    const rows = trades
+      .slice(-CONFIG.RECENT_TRADES_MAX)
+      .reverse()
+      .map(
+        (t) =>
+          '<div class="trade-row trade-row--' +
+          t.side +
+          '"><span class="trade-row__price">' +
+          formatPrice(t.price) +
+          '</span><span>' +
+          formatSize(t.size) +
+          '</span><span>' +
+          formatTime(t.time) +
+          '</span></div>'
+      )
+      .join('');
+    el.tradesList.innerHTML = rows + el.tradesList.innerHTML;
+
+    // cap DOM size
+    while (el.tradesList.children.length > CONFIG.RECENT_TRADES_MAX) {
+      el.tradesList.removeChild(el.tradesList.lastChild);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Timeframe buttons
+  // ---------------------------------------------------------------------
+
+  function buildTimeframeButtons() {
+    el.timeframes.innerHTML = '';
+    CONFIG.TIMEFRAMES.forEach((tf) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'timeframe-btn' + (tf.key === state.currentInterval ? ' active' : '');
+      btn.textContent = tf.label;
+      btn.dataset.key = tf.key;
+      btn.addEventListener('click', () => selectTimeframe(tf.key));
+      el.timeframes.appendChild(btn);
     });
   }
 
-  async function loadChartForTimeframe(id) {
-    const tf = getTimeframe(id);
-    const end = Date.now();
-    const start = end - tf.rangeMs;
+  async function selectTimeframe(key) {
+    if (key === state.currentInterval) return;
+    state.currentInterval = key;
+    localStorage.setItem(CONFIG.STORAGE_KEYS.TIMEFRAME, key);
+    [...el.timeframes.children].forEach((b) => b.classList.toggle('active', b.dataset.key === key));
+
+    client.setCandleInterval(key);
+    await loadHistoryForInterval(key);
+  }
+
+  async function loadHistoryForInterval(interval) {
     try {
-      const candles = await Hyperliquid.fetchCandles(state.coin, tf.interval, start, end);
-      PriceChart.setHistory(candles);
-    } catch (e) {
-      console.error('[app] failed to load candle history', e);
-      showError('Could not load chart history from Hyperliquid. It will keep trying to reconnect.');
+      const tf = CONFIG.TIMEFRAMES.find((t) => t.key === interval);
+      const end = Date.now();
+      const start = end - tf.ms * CONFIG.CANDLE_LOOKBACK_BARS;
+      const candles = await client.fetchCandles(interval, start, end);
+      chart.setHistory(candles);
+      if (state.lastPrice !== null) chart.setCurrentPriceLine(state.lastPrice);
+    } catch (err) {
+      console.error('Failed to load candle history:', err);
     }
   }
 
-  async function selectTimeframe(id) {
-    if (id === state.timeframeId) return;
-    state.timeframeId = id;
-    try {
-      localStorage.setItem(CONFIG.STORAGE_TIMEFRAME, id);
-    } catch (e) { /* localStorage may be unavailable in private mode */ }
-    renderTimeframeButtons();
-    const tf = getTimeframe(id);
-    state.interval = tf.interval;
-    await loadChartForTimeframe(id);
-    Hyperliquid.setActiveInterval(tf.interval);
-  }
-
-  // ------------------------------------------------------------------
-  // 24H HIGH / LOW (independent of chart timeframe)
-  // ------------------------------------------------------------------
-  async function refreshDayStats() {
-    if (!state.coin) return;
-    const end = Date.now();
-    const start = end - 24 * 60 * 60 * 1000;
-    try {
-      const candles = await Hyperliquid.fetchCandles(state.coin, CONFIG.STATS_24H_INTERVAL, start, end);
-      if (!candles.length) return;
-      state.dayHigh = Math.max(...candles.map((c) => c.high));
-      state.dayLow = Math.min(...candles.map((c) => c.low));
-      renderStats();
-    } catch (e) {
-      console.error('[app] failed to refresh 24h stats', e);
-      // Non-fatal — keep whatever we last had rather than blanking the UI.
-    }
-  }
-
-  // ------------------------------------------------------------------
+  // ---------------------------------------------------------------------
   // Alerts UI
-  // ------------------------------------------------------------------
-  function renderAlert() {
-    const alert = Alerts.get();
-    if (!alert) {
-      els.alertActive.hidden = true;
-      return;
+  // ---------------------------------------------------------------------
+
+  function renderAlertLabel() {
+    if (alertManager.alert) {
+      const { price, direction } = alertManager.alert;
+      el.activeAlertLabel.textContent = `Alert: ${direction === 'above' ? 'ABOVE' : 'BELOW'} ${formatPrice(price)}`;
+      el.clearAlertBtn.hidden = false;
+    } else {
+      el.activeAlertLabel.textContent = 'No alert set';
+      el.clearAlertBtn.hidden = true;
     }
-    els.alertActive.hidden = false;
-    const symbol = alert.condition === 'above' ? '>' : '<';
-    const decimals = decimalsFor(alert.price);
-    els.alertActiveText.textContent = `${CONFIG.DISPLAY_SYMBOL} ${symbol} $${formatUsd(alert.price, { decimals })}`;
-    els.alertToggle.textContent = alert.enabled ? 'Disable' : 'Enable';
-    els.alertActive.classList.toggle('is-disabled', !alert.enabled);
   }
 
-  function wireAlertForm() {
-    els.alertForm.addEventListener('submit', async (evt) => {
-      evt.preventDefault();
-      const price = parseFloat(els.alertPriceInput.value);
-      if (!isFinite(price) || price <= 0) return;
-      const condition = els.alertCondition.value === 'below' ? 'below' : 'above';
-      Alerts.set(price, condition);
-      await Alerts.requestNotificationPermission();
-      els.alertPriceInput.value = '';
-      renderAlert();
-    });
-
-    els.alertToggle.addEventListener('click', () => {
-      const alert = Alerts.get();
-      if (!alert) return;
-      Alerts.setEnabled(!alert.enabled);
-      renderAlert();
-    });
-
-    els.alertDelete.addEventListener('click', () => {
-      Alerts.clear();
-      renderAlert();
-    });
-
-    els.alertFiredClose.addEventListener('click', () => {
-      els.alertFired.hidden = true;
-    });
+  function showToast(message) {
+    el.toastBody.textContent = message;
+    el.toast.hidden = false;
   }
 
-  function showAlertFiredBanner(price) {
-    const alert = Alerts.get();
-    const decimals = decimalsFor(price);
-    els.alertFiredText.textContent = `${CONFIG.DISPLAY_SYMBOL} has reached $${formatUsd(price, { decimals })}`;
-    els.alertFired.hidden = false;
-    renderAlert();
-  }
+  el.toastClose.addEventListener('click', () => {
+    el.toast.hidden = true;
+  });
 
-  // ------------------------------------------------------------------
-  // Hyperliquid event wiring
-  // ------------------------------------------------------------------
-  function wireHyperliquid() {
-    Hyperliquid.on('status', renderStatus);
+  el.alertForm.addEventListener('submit', (e) => {
+    e.preventDefault();
+    alertManager.unlockAudio(); // user gesture — safe to unlock audio here too
+    const price = parseFloat(el.alertPrice.value);
+    const direction = el.alertDirection.value;
+    if (alertManager.setAlert(price, direction)) {
+      renderAlertLabel();
+      el.alertPrice.value = '';
+    }
+  });
 
-    Hyperliquid.on('price', (tick) => {
-      const price = tick.markPx ?? tick.midPx;
-      if (price == null || !isFinite(price)) return;
+  el.clearAlertBtn.addEventListener('click', () => {
+    alertManager.clearAlert();
+    renderAlertLabel();
+  });
 
-      const prevPrice = state.lastPrice;
-      state.lastPrice = price;
-      state.lastMessageAt = tick.receivedAt || Date.now();
+  el.soundToggle.addEventListener('change', () => {
+    alertManager.unlockAudio();
+    alertManager.setSound(el.soundToggle.checked);
+  });
 
-      if (tick.prevDayPx != null) state.prevDayPx = tick.prevDayPx;
-      if (tick.dayNtlVlm != null) state.dayVolume = tick.dayNtlVlm;
+  // ---------------------------------------------------------------------
+  // Details collapsible
+  // ---------------------------------------------------------------------
 
-      // Keep the running 24h high/low honest even between REST refreshes.
-      if (state.dayHigh == null || price > state.dayHigh) state.dayHigh = price;
-      if (state.dayLow == null || price < state.dayLow) state.dayLow = price;
+  el.detailsToggle.addEventListener('click', () => {
+    const expanded = el.detailsToggle.getAttribute('aria-expanded') === 'true';
+    el.detailsToggle.setAttribute('aria-expanded', String(!expanded));
+    el.detailsBody.hidden = expanded;
+  });
 
-      renderPrice(price, prevPrice);
-      renderChange();
-      renderStats();
-      hideError();
+  // ---------------------------------------------------------------------
+  // Init
+  // ---------------------------------------------------------------------
 
-      PriceChart.updateCurrentPriceLine(price, state.prevDayPx == null || price >= state.prevDayPx);
+  const chart = new PriceChart(el.chartContainer);
 
-      if (Alerts.checkPrice(price)) {
-        showAlertFiredBanner(price);
-      }
-    });
+  const alertManager = new AlertManager(({ price, direction, target }) => {
+    showToast(`BTC/USDC has reached ${formatPrice(price)} (${direction === 'above' ? 'above' : 'below'} ${formatPrice(target)})`);
+    renderAlertLabel();
+  });
+  el.soundToggle.checked = alertManager.soundOn;
+  renderAlertLabel();
 
-    Hyperliquid.on('candle', (candle) => {
-      if (candle.interval !== state.interval) return;
-      PriceChart.updateBar(candle);
-    });
-
-    Hyperliquid.on('error', (message) => {
-      console.error('[Hyperliquid]', message);
-    });
-  }
-
-  // ------------------------------------------------------------------
-  // Boot
-  // ------------------------------------------------------------------
-  async function boot() {
-    wireAlertForm();
-    renderAlert();
-    wireHyperliquid();
-
-    els.timeframeBar.addEventListener('click', (evt) => {
-      const btn = evt.target.closest('button[data-tf]');
-      if (!btn) return;
-      selectTimeframe(btn.dataset.tf);
-    });
-
-    els.retryButton.addEventListener('click', () => {
-      hideError();
-      init();
-    });
-
-    let savedTf = CONFIG.DEFAULT_TIMEFRAME;
-    try {
-      savedTf = localStorage.getItem(CONFIG.STORAGE_TIMEFRAME) || CONFIG.DEFAULT_TIMEFRAME;
-    } catch (e) { /* ignore */ }
-    if (!CONFIG.TIMEFRAMES.some((tf) => tf.id === savedTf)) savedTf = CONFIG.DEFAULT_TIMEFRAME;
-    state.timeframeId = savedTf;
-    renderTimeframeButtons();
-
-    PriceChart.init(els.chartContainer);
-
-    state.tickTimer = setInterval(renderLastUpdated, 1000);
-
-    await init();
-  }
+  const client = new HyperliquidClient({
+    onStatusChange: setStatus,
+    onMarketResolved: ({ displayName }) => {
+      const [base, quote] = displayName.split('/');
+      el.pairName.textContent = `BTC / ${quote || 'USDC'}`;
+      el.dSymbol.textContent = displayName + ` (${client.coinId})`;
+    },
+    onMids: ({ price, time }) => renderPrice(price, time),
+    onBook: (book) => {
+      renderBook(book);
+      updateFooterTime(book.time);
+    },
+    onTrades: (trades) => renderTrades(trades),
+    onCandle: (candle) => chart.updateBar(candle),
+    onLatency: (ms) => {
+      el.footerLatency.hidden = false;
+      el.footerLatency.textContent = 'Latency: ' + ms + ' ms';
+    },
+    onError: (msg) => console.warn('[Hyperliquid]', msg),
+  });
 
   async function init() {
+    buildTimeframeButtons();
+    setStatus('connecting');
+
     try {
-      const market = await Hyperliquid.resolveMarket();
-      state.coin = market.coin;
-      els.symbolBadge.textContent = `${CONFIG.EXCHANGE_LABEL} · ${market.coin}`;
-
-      const tf = getTimeframe(state.timeframeId);
-      state.interval = tf.interval;
-
-      await loadChartForTimeframe(state.timeframeId);
-      await refreshDayStats();
-
-      if (state.statsTimer) clearInterval(state.statsTimer);
-      state.statsTimer = setInterval(refreshDayStats, CONFIG.STATS_REFRESH_MS);
-
-      Hyperliquid.connect(state.coin);
-    } catch (e) {
-      console.error('[app] failed to initialize market', e);
-      showError('Could not reach Hyperliquid to resolve the BTC/USDC market. Check your connection and retry.');
+      await client.resolveMarket();
+    } catch (err) {
+      console.error(err);
+      setStatus('disconnected');
+      el.heroPrice.textContent = 'Unavailable';
+      return;
     }
+
+    // Load initial REST snapshot (24h stats + candle history) before the
+    // WebSocket takes over for live updates.
+    try {
+      const [stats, rolling, candles] = await Promise.all([
+        client.fetchInitialStats(),
+        client.fetchRolling24h(),
+        (async () => {
+          const tf = CONFIG.TIMEFRAMES.find((t) => t.key === state.currentInterval);
+          const end = Date.now();
+          const start = end - tf.ms * CONFIG.CANDLE_LOOKBACK_BARS;
+          return client.fetchCandles(state.currentInterval, start, end);
+        })(),
+      ]);
+
+      state.prevDayPx = stats.prevDayPx;
+      state.volumeUsdc24h = stats.dayNtlVlm;
+      if (rolling) {
+        state.high24h = rolling.high;
+        state.low24h = rolling.low;
+        state.baseVolume24h = state.volumeUsdc24h === null ? rolling.baseVolume : null;
+      }
+
+      const initialPrice = stats.markPx ?? stats.midPx;
+      if (initialPrice !== null) renderPrice(initialPrice, Date.now());
+      renderStaticStats();
+      chart.setHistory(candles);
+    } catch (err) {
+      console.error('Failed to load initial market data:', err);
+    }
+
+    client.connect();
   }
 
-  document.addEventListener('DOMContentLoaded', boot);
+  init();
 })();

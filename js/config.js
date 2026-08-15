@@ -1,54 +1,67 @@
 /**
  * config.js
- * Central configuration for the BTC/USDC Hyperliquid dashboard.
- * No secrets, no keys, no user credentials live here or anywhere in this app.
+ * Central configuration for the Hyperliquid BTC/USDC dashboard.
+ * No secrets, no API keys — every endpoint here is public market data.
  */
+
 const CONFIG = Object.freeze({
-  // --- Hyperliquid endpoints (mainnet) ---
-  REST_URL: 'https://api.hyperliquid.xyz/info',
+  // Official Hyperliquid public endpoints (mainnet).
+  // Docs: https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api
+  INFO_URL: 'https://api.hyperliquid.xyz/info',
   WS_URL: 'wss://api.hyperliquid.xyz/ws',
 
-  // --- Market identification ---
-  // Hyperliquid spot markets are addressed as "@<index>" (except PURR/USDC,
-  // which is addressed by name). The index for BTC/USDC (the "UBTC/USDC"
-  // pair on HyperCore) is NOT hard-coded here: app.js resolves it at runtime
-  // from the live `spotMeta` response so the dashboard never trades on a
-  // stale or guessed identifier. See hyperliquid.js#resolveMarket().
-  BASE_TOKEN_NAME: 'UBTC',      // on-chain token backing BTC on HyperCore
+  // The base token symbol we're looking for in spotMeta's token list.
+  // Hyperliquid remaps "BTC/USDC" (as shown on app.hyperliquid.xyz) to the
+  // underlying HyperCore token "UBTC" paired against USDC (token index 0).
+  // We NEVER hard-code the market's numeric index — it is resolved at
+  // runtime from spotMeta so the dashboard keeps working if Hyperliquid
+  // reorders the spot universe.
+  BASE_TOKEN_CANDIDATES: ['UBTC', 'BTC'],
   QUOTE_TOKEN_NAME: 'USDC',
-  DISPLAY_SYMBOL: 'BTC/USDC',   // label shown in the UI (matches app.hyperliquid.xyz)
-  EXCHANGE_LABEL: 'Hyperliquid',
+  QUOTE_TOKEN_INDEX: 0,
 
-  // --- Timeframes available on the chart ---
-  // range: how far back the chart looks. interval: Hyperliquid candle bucket.
+  // Fallback used only if dynamic resolution fails entirely (see hyperliquid.js).
+  // This is a last-resort display label, never sent to the API as a symbol.
+  FALLBACK_DISPLAY_NAME: 'UBTC/USDC',
+
+  // Timeframe buttons -> Hyperliquid candle "interval" strings + duration in ms.
   TIMEFRAMES: [
-    { id: '1H', label: '1H', rangeMs: 1 * 60 * 60 * 1000, interval: '1m' },
-    { id: '4H', label: '4H', rangeMs: 4 * 60 * 60 * 1000, interval: '5m' },
-    { id: '1D', label: '1D', rangeMs: 24 * 60 * 60 * 1000, interval: '15m' },
-    { id: '1W', label: '1W', rangeMs: 7 * 24 * 60 * 60 * 1000, interval: '1h' },
-    { id: '1M', label: '1M', rangeMs: 30 * 24 * 60 * 60 * 1000, interval: '4h' },
+    { key: '1m', label: '1M', ms: 60 * 1000 },
+    { key: '5m', label: '5M', ms: 5 * 60 * 1000 },
+    { key: '15m', label: '15M', ms: 15 * 60 * 1000 },
+    { key: '1h', label: '1H', ms: 60 * 60 * 1000 },
+    { key: '4h', label: '4H', ms: 4 * 60 * 60 * 1000 },
+    { key: '1d', label: '1D', ms: 24 * 60 * 60 * 1000 },
   ],
-  DEFAULT_TIMEFRAME: '1D',
+  DEFAULT_TIMEFRAME: '15m',
 
-  // Candle interval always used for the running 24H HIGH / 24H LOW stat,
-  // independent of whatever timeframe the chart is showing.
-  STATS_24H_INTERVAL: '1h',
+  // How many bars of history to request per timeframe (kept well under the
+  // documented 5000-candle-per-request ceiling).
+  CANDLE_LOOKBACK_BARS: 300,
 
-  // --- WebSocket behavior ---
-  WS_PING_INTERVAL_MS: 25_000,       // keep-alive ping cadence
-  WS_STALE_AFTER_MS: 15_000,         // no message in this long -> treat as stale
-  WS_RECONNECT_BASE_MS: 1_000,       // first reconnect delay
-  WS_RECONNECT_MAX_MS: 30_000,       // exponential backoff ceiling
-  WS_RECONNECT_JITTER_MS: 400,
+  // Reconnection backoff schedule, in ms. Resets to index 0 after a
+  // successful, stable connection.
+  RECONNECT_DELAYS_MS: [1000, 2000, 4000, 8000, 16000, 30000],
 
-  // --- REST refresh (only used for things WS doesn't push, e.g. candles) ---
-  STATS_REFRESH_MS: 60_000,          // re-pull 24H high/low candles periodically
+  // Order book depth to render per side.
+  ORDER_BOOK_LEVELS: 10,
 
-  // --- Local storage keys ---
-  STORAGE_TIMEFRAME: 'btcUsdcHL:selectedTimeframe',
-  STORAGE_ALERT: 'btcUsdcHL:priceAlert',
+  // Recent trades panel row cap.
+  RECENT_TRADES_MAX: 25,
 
-  // --- UI behavior ---
-  PRICE_FLASH_MS: 400,
-  STALE_LABEL_AFTER_MS: 20_000,      // "last updated" copy switches to a warning
+  // Price flash animation duration (ms) — must stay in the 300-500ms band.
+  FLASH_DURATION_MS: 400,
+
+  // localStorage keys.
+  STORAGE_KEYS: {
+    TIMEFRAME: 'hl_btcusdc_timeframe',
+    ALERT: 'hl_btcusdc_alert',
+    ALERT_SOUND: 'hl_btcusdc_alert_sound',
+  },
+
+  // Rolling-24h stats are derived from 1h candles (24 of them) rather than
+  // guessed, since Hyperliquid's spotMetaAndAssetCtxs response does not
+  // include high/low fields.
+  ROLLING_24H_INTERVAL: '1h',
+  ROLLING_24H_BARS: 24,
 });

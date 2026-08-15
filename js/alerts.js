@@ -1,103 +1,133 @@
 /**
  * alerts.js
- * A single, simple price alert stored in localStorage. No backend, no push
- * service — this only works while the tab is open, which is stated plainly
- * in the UI so nobody expects otherwise.
+ * Fully client-side price alert system. Nothing here talks to a backend —
+ * the alert configuration lives in localStorage, and triggering happens
+ * entirely in the browser as live prices stream in.
  */
-const Alerts = (() => {
-  let current = null; // { price, condition: 'above'|'below', enabled, triggered }
 
-  function load() {
-    try {
-      const raw = localStorage.getItem(CONFIG.STORAGE_ALERT);
-      current = raw ? JSON.parse(raw) : null;
-    } catch (e) {
-      current = null;
-    }
-    return current;
-  }
-
-  function save() {
-    try {
-      if (current) {
-        localStorage.setItem(CONFIG.STORAGE_ALERT, JSON.stringify(current));
-      } else {
-        localStorage.removeItem(CONFIG.STORAGE_ALERT);
-      }
-    } catch (e) {
-      console.warn('[Alerts] localStorage unavailable, alert will not persist across reloads');
-    }
-  }
-
-  function set(price, condition) {
-    current = { price: Number(price), condition, enabled: true, triggered: false };
-    save();
-    return current;
-  }
-
-  function setEnabled(enabled) {
-    if (!current) return;
-    current.enabled = enabled;
-    if (enabled) current.triggered = false;
-    save();
-  }
-
-  function clear() {
-    current = null;
-    save();
-  }
-
-  function get() {
-    return current;
-  }
-
-  async function requestNotificationPermission() {
-    if (!('Notification' in window)) return 'unsupported';
-    if (Notification.permission === 'granted' || Notification.permission === 'denied') {
-      return Notification.permission;
-    }
-    try {
-      return await Notification.requestPermission();
-    } catch (e) {
-      return 'denied';
-    }
-  }
-
-  function notify(price) {
-    const body = `${CONFIG.DISPLAY_SYMBOL} has reached $${formatUsd(price)}`;
-    if ('Notification' in window && Notification.permission === 'granted') {
-      try {
-        new Notification('🔔 BTC/USDC price alert', { body });
-      } catch (e) {
-        /* fall through to in-page banner, handled by app.js */
-      }
-    }
-  }
-
-  function formatUsd(value) {
-    return Number(value).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  }
-
+class AlertManager {
   /**
-   * Checks a fresh price against the active alert. Returns true exactly
-   * once when the threshold is crossed, so callers can fire a single
-   * notification instead of repeating it on every tick.
+   * @param {(alert: {price:number, direction:string}) => void} onTrigger
    */
-  function checkPrice(price) {
-    if (!current || !current.enabled || current.triggered) return false;
-    const crossed =
-      (current.condition === 'above' && price >= current.price) ||
-      (current.condition === 'below' && price <= current.price);
-    if (crossed) {
-      current.triggered = true;
-      save();
-      notify(price);
-      return true;
-    }
-    return false;
+  constructor(onTrigger) {
+    this.onTrigger = onTrigger;
+    this.alert = this._load();
+    this.soundOn = localStorage.getItem(CONFIG.STORAGE_KEYS.ALERT_SOUND) === 'true';
+    this._armed = !!this.alert;
+    this._audioCtx = null;
   }
 
-  load();
+  _load() {
+    try {
+      const raw = localStorage.getItem(CONFIG.STORAGE_KEYS.ALERT);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (
+        parsed &&
+        typeof parsed.price === 'number' &&
+        (parsed.direction === 'above' || parsed.direction === 'below')
+      ) {
+        return parsed;
+      }
+    } catch (_) {
+      /* ignore corrupt storage */
+    }
+    return null;
+  }
 
-  return { set, setEnabled, clear, get, checkPrice, requestNotificationPermission };
-})();
+  setAlert(price, direction) {
+    if (!Number.isFinite(price) || price <= 0) return false;
+    if (direction !== 'above' && direction !== 'below') return false;
+    this.alert = { price, direction };
+    this._armed = true;
+    localStorage.setItem(CONFIG.STORAGE_KEYS.ALERT, JSON.stringify(this.alert));
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+    return true;
+  }
+
+  clearAlert() {
+    this.alert = null;
+    this._armed = false;
+    localStorage.removeItem(CONFIG.STORAGE_KEYS.ALERT);
+  }
+
+  setSound(on) {
+    this.soundOn = on;
+    localStorage.setItem(CONFIG.STORAGE_KEYS.ALERT_SOUND, String(on));
+  }
+
+  /** Call on every live price tick. */
+  checkPrice(price) {
+    if (!this._armed || !this.alert || !Number.isFinite(price)) return;
+
+    const { price: target, direction } = this.alert;
+    const hit = direction === 'above' ? price >= target : price <= target;
+    if (!hit) return;
+
+    this._armed = false; // fire once per configured level
+    this._notify(price);
+    if (this.soundOn) this._playSound();
+    this.onTrigger?.({ price, direction, target });
+  }
+
+  /** Re-arm the same stored alert (e.g. user dismisses the banner but wants to keep watching). */
+  rearm() {
+    if (this.alert) this._armed = true;
+  }
+
+  _notify(price) {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    try {
+      new Notification('BTC/USDC Price Alert', {
+        body: `BTC/USDC has reached $${price.toLocaleString(undefined, { maximumFractionDigits: 2 })}`,
+      });
+    } catch (_) {
+      /* Notifications unsupported in this context — ignore. */
+    }
+  }
+
+  _playSound() {
+    // Must only run after a user interaction elsewhere on the page has
+    // unlocked the AudioContext (browser autoplay policy).
+    try {
+      if (!this._audioCtx) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        this._audioCtx = new Ctx();
+      }
+      const ctx = this._audioCtx;
+      if (ctx.state === 'suspended') ctx.resume();
+
+      const now = ctx.currentTime;
+      [880, 1320].forEach((freq, i) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0.0001, now + i * 0.18);
+        gain.gain.exponentialRampToValueAtTime(0.2, now + i * 0.18 + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + i * 0.18 + 0.35);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(now + i * 0.18);
+        osc.stop(now + i * 0.18 + 0.4);
+      });
+    } catch (_) {
+      /* audio not available — fail silently, visual/notification alert still fires */
+    }
+  }
+
+  unlockAudio() {
+    try {
+      if (!this._audioCtx) {
+        const Ctx = window.AudioContext || window.webkitAudioContext;
+        if (Ctx) this._audioCtx = new Ctx();
+      } else if (this._audioCtx.state === 'suspended') {
+        this._audioCtx.resume();
+      }
+    } catch (_) {
+      /* no-op */
+    }
+  }
+}
